@@ -2,158 +2,145 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <unistd.h>
-#include <string.h>
 #include <pthread.h>
 #include <sched.h>
-#include <errno.h>
 #include <pigpio.h>
 
-#define AHT10_ADDR          0x38
-#define I2C_BUS             1
-#define FAN_GPIO            18
+#define AHT10_ADDR 0x38
+#define I2C_BUS 1
+#define FAN_GPIO 18
 
-#define TEMP_ON_THRESHOLD   30.0f
-#define TEMP_OFF_THRESHOLD  25.0f
+#define TEMP_ALTA 30.0f
+#define TEMP_BAJA 25.0f
 
-#define OVER_TEMP_TIME_US   60000000UL   // 60 s
-#define FAN_HOLD_TIME_US    120000000UL  // 120 s
+#define TIEMPO_SOBRETEMP_US 60000000UL   // 60 s
+#define TIEMPO_VENT_US      120000000UL  // 120 s
 
 typedef enum {
-    ESTADO_REPOSO = 0,
-    ESTADO_ALERTA,
-    ESTADO_VENTILACION
-} estado_t;
+    REPOSO,
+    ALERTA,
+    VENTILACION
+} Estado;
 
-/* -------------------- Variables globales compartidas -------------------- */
+pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 
-static pthread_mutex_t mutex_datos = PTHREAD_MUTEX_INITIALIZER;
+float temperatura = 0.0f;
+Estado estado = REPOSO;
+int ventilador = 0;
+int ejecutando = 1;
 
-static float temperatura_actual = 0.0f;
-static estado_t estado_actual = ESTADO_REPOSO;
-static int ventilador_encendido = 0;
-static int sistema_activo = 1;
+/* ---------------- FUNCIONES AUXILIARES ---------------- */
 
-/* -------------------- Utilidades -------------------- */
-
-static const char *estado_a_texto(estado_t e) {
+const char* texto_estado(Estado e) {
     switch (e) {
-        case ESTADO_REPOSO:       return "REPOSO";
-        case ESTADO_ALERTA:       return "ALERTA";
-        case ESTADO_VENTILACION:  return "VENTILACION";
-        default:                  return "DESCONOCIDO";
+        case REPOSO: return "REPOSO";
+        case ALERTA: return "ALERTA";
+        case VENTILACION: return "VENTILACION";
+        default: return "DESCONOCIDO";
     }
 }
 
-/* Delta de tiempo usando gpioTick() */
-static uint32_t delta_ticks(uint32_t inicio, uint32_t fin) {
-    return fin - inicio; /* maneja overflow natural de uint32_t */
+uint32_t tiempo_transcurrido(uint32_t inicio, uint32_t fin) {
+    return fin - inicio;
 }
 
-/* -------------------- Manejo AHT10 -------------------- */
+void guardar_temperatura(float t) {
+    pthread_mutex_lock(&mutex);
+    temperatura = t;
+    pthread_mutex_unlock(&mutex);
+}
 
-/*
- * Inicialización típica del AHT10.
- * Según implementación real, el sensor puede requerir pequeños ajustes.
- */
-static int aht10_init(int i2c_handle) {
+float leer_temperatura_global() {
+    float t;
+    pthread_mutex_lock(&mutex);
+    t = temperatura;
+    pthread_mutex_unlock(&mutex);
+    return t;
+}
+
+void cambiar_estado(Estado nuevo_estado) {
+    pthread_mutex_lock(&mutex);
+    estado = nuevo_estado;
+    pthread_mutex_unlock(&mutex);
+}
+
+Estado leer_estado() {
+    Estado e;
+    pthread_mutex_lock(&mutex);
+    e = estado;
+    pthread_mutex_unlock(&mutex);
+    return e;
+}
+
+void set_ventilador(int on) {
+    gpioWrite(FAN_GPIO, on);
+
+    pthread_mutex_lock(&mutex);
+    ventilador = on;
+    pthread_mutex_unlock(&mutex);
+}
+
+/* ---------------- AHT10 ---------------- */
+
+int aht10_init(int fd) {
     char cmd[3] = {0xE1, 0x08, 0x00};
 
-    if (i2cWriteDevice(i2c_handle, cmd, 3) < 0) {
+    if (i2cWriteDevice(fd, cmd, 3) < 0)
         return -1;
-    }
 
-    time_sleep(0.04); // 40 ms
+    time_sleep(0.04);
     return 0;
 }
 
-static int aht10_trigger_measurement(int i2c_handle) {
+int aht10_medir(int fd, float *temp) {
     char cmd[3] = {0xAC, 0x33, 0x00};
-
-    if (i2cWriteDevice(i2c_handle, cmd, 3) < 0) {
-        return -1;
-    }
-
-    time_sleep(0.08); // esperar medición
-    return 0;
-}
-
-/*
- * Lee 6 bytes y extrae temperatura.
- * Fórmula típica AHT10:
- * Temp = ((rawTemp / 2^20) * 200) - 50
- */
-static int aht10_read_temperature(int i2c_handle, float *temp_c) {
     char data[6];
 
-    if (aht10_trigger_measurement(i2c_handle) < 0) {
+    if (i2cWriteDevice(fd, cmd, 3) < 0)
         return -1;
-    }
 
-    if (i2cReadDevice(i2c_handle, data, 6) < 0) {
-        return -1;
-    }
+    time_sleep(0.08);
 
-    /* Bit busy en byte 0, bit 7 */
-    if (data[0] & 0x80) {
+    if (i2cReadDevice(fd, data, 6) < 0)
         return -1;
-    }
+
+    if (data[0] & 0x80)
+        return -1;
 
     uint32_t raw_temp = ((uint32_t)(data[3] & 0x0F) << 16) |
                         ((uint32_t)(uint8_t)data[4] << 8) |
                         (uint32_t)(uint8_t)data[5];
 
-    *temp_c = ((raw_temp * 200.0f) / 1048576.0f) - 50.0f;
+    *temp = ((raw_temp * 200.0f) / 1048576.0f) - 50.0f;
     return 0;
 }
 
-/* -------------------- GPIO ventilador -------------------- */
+/* ---------------- CONFIGURACION DE HILOS ---------------- */
 
-static void set_ventilador(int on) {
-    gpioWrite(FAN_GPIO, on ? 1 : 0);
-
-    pthread_mutex_lock(&mutex_datos);
-    ventilador_encendido = on ? 1 : 0;
-    pthread_mutex_unlock(&mutex_datos);
-}
-
-/* -------------------- Configuración de hilos -------------------- */
-
-static int configurar_hilo_fifo(pthread_t thread, int prioridad) {
+void configurar_fifo(pthread_t hilo, int prioridad) {
     struct sched_param param;
     param.sched_priority = prioridad;
-
-    if (pthread_setschedparam(thread, SCHED_FIFO, &param) != 0) {
-        return -1;
-    }
-    return 0;
+    pthread_setschedparam(hilo, SCHED_FIFO, &param);
 }
 
-static int configurar_hilo_other(pthread_t thread) {
+void configurar_other(pthread_t hilo) {
     struct sched_param param;
     param.sched_priority = 0;
-
-    if (pthread_setschedparam(thread, SCHED_OTHER, &param) != 0) {
-        return -1;
-    }
-    return 0;
+    pthread_setschedparam(hilo, SCHED_OTHER, &param);
 }
 
-/* -------------------- Tarea A: adquisición -------------------- */
+/* ---------------- HILO A: ADQUISICION ---------------- */
 
-void *tarea_adquisicion(void *arg) {
-    int i2c_handle = *(int *)arg;
+void* hilo_adquisicion(void *arg) {
+    int fd = *(int*)arg;
 
-    while (sistema_activo) {
-        float temp_leida = 0.0f;
+    while (ejecutando) {
+        float t;
 
-        /* IMPORTANTE: leer I2C sin tener el mutex tomado */
-        if (aht10_read_temperature(i2c_handle, &temp_leida) == 0) {
-            pthread_mutex_lock(&mutex_datos);
-            temperatura_actual = temp_leida;
-            pthread_mutex_unlock(&mutex_datos);
+        if (aht10_medir(fd, &t) == 0) {
+            guardar_temperatura(t);
         } else {
-            /* Se podría loguear error, pero fuera de mutex */
-            fprintf(stderr, "[Adquisicion] Error al leer AHT10\n");
+            printf("[Adquisicion] Error al leer sensor\n");
         }
 
         sleep(1);
@@ -162,125 +149,81 @@ void *tarea_adquisicion(void *arg) {
     return NULL;
 }
 
-/* -------------------- Tarea B: control lógico -------------------- */
+/* ---------------- HILO B: CONTROL ---------------- */
 
-void *tarea_control(void *arg) {
+void* hilo_control(void *arg) {
     (void)arg;
 
-    uint32_t t_inicio_sobretemp = 0;
-    int sobretemp_activa = 0;
+    uint32_t inicio_sobretemp = 0;
+    uint32_t inicio_vent = 0;
+    int contando_sobretemp = 0;
 
-    uint32_t t_inicio_vent = 0;
-
-    while (sistema_activo) {
-        float temp_local;
-        estado_t estado_local;
-
-        /* Copia rápida de datos compartidos */
-        pthread_mutex_lock(&mutex_datos);
-        temp_local = temperatura_actual;
-        estado_local = estado_actual;
-        pthread_mutex_unlock(&mutex_datos);
-
+    while (ejecutando) {
+        float t = leer_temperatura_global();
+        Estado e = leer_estado();
         uint32_t ahora = gpioTick();
 
-        switch (estado_local) {
-            case ESTADO_REPOSO:
-                if (temp_local > TEMP_ON_THRESHOLD) {
-                    if (!sobretemp_activa) {
-                        sobretemp_activa = 1;
-                        t_inicio_sobretemp = ahora;
-                    }
-
-                    pthread_mutex_lock(&mutex_datos);
-                    estado_actual = ESTADO_ALERTA;
-                    pthread_mutex_unlock(&mutex_datos);
-                } else {
-                    sobretemp_activa = 0;
+        switch (e) {
+            case REPOSO:
+                if (t > TEMP_ALTA) {
+                    inicio_sobretemp = ahora;
+                    contando_sobretemp = 1;
+                    cambiar_estado(ALERTA);
                 }
                 break;
 
-            case ESTADO_ALERTA:
-                if (temp_local > TEMP_ON_THRESHOLD) {
-                    if (!sobretemp_activa) {
-                        sobretemp_activa = 1;
-                        t_inicio_sobretemp = ahora;
-                    }
-
-                    if (delta_ticks(t_inicio_sobretemp, ahora) >= OVER_TEMP_TIME_US) {
+            case ALERTA:
+                if (t > TEMP_ALTA) {
+                    if (contando_sobretemp &&
+                        tiempo_transcurrido(inicio_sobretemp, ahora) >= TIEMPO_SOBRETEMP_US) {
                         set_ventilador(1);
-                        t_inicio_vent = gpioTick();
-
-                        pthread_mutex_lock(&mutex_datos);
-                        estado_actual = ESTADO_VENTILACION;
-                        pthread_mutex_unlock(&mutex_datos);
-
-                        sobretemp_activa = 0;
+                        inicio_vent = ahora;
+                        cambiar_estado(VENTILACION);
+                        contando_sobretemp = 0;
                     }
                 } else {
-                    sobretemp_activa = 0;
-
-                    pthread_mutex_lock(&mutex_datos);
-                    estado_actual = ESTADO_REPOSO;
-                    pthread_mutex_unlock(&mutex_datos);
+                    contando_sobretemp = 0;
+                    cambiar_estado(REPOSO);
                 }
                 break;
 
-            case ESTADO_VENTILACION:
-                if (temp_local < TEMP_OFF_THRESHOLD) {
+            case VENTILACION:
+                if (t < TEMP_BAJA ||
+                    tiempo_transcurrido(inicio_vent, ahora) >= TIEMPO_VENT_US) {
                     set_ventilador(0);
-
-                    pthread_mutex_lock(&mutex_datos);
-                    estado_actual = ESTADO_REPOSO;
-                    pthread_mutex_unlock(&mutex_datos);
-                } else if (delta_ticks(t_inicio_vent, ahora) >= FAN_HOLD_TIME_US) {
-                    set_ventilador(0);
-
-                    pthread_mutex_lock(&mutex_datos);
-                    estado_actual = ESTADO_REPOSO;
-                    pthread_mutex_unlock(&mutex_datos);
+                    cambiar_estado(REPOSO);
                 }
-                break;
-
-            default:
-                pthread_mutex_lock(&mutex_datos);
-                estado_actual = ESTADO_REPOSO;
-                pthread_mutex_unlock(&mutex_datos);
                 break;
         }
 
-        usleep(100000); // 100 ms de período de control
+        usleep(100000); // 100 ms
     }
 
     return NULL;
 }
 
-/* -------------------- Tarea C: diagnóstico -------------------- */
+/* ---------------- HILO C: DIAGNOSTICO ---------------- */
 
-void *tarea_diagnostico(void *arg) {
+void* hilo_diagnostico(void *arg) {
     (void)arg;
 
-    uint32_t t0 = gpioTick();
+    uint32_t inicio = gpioTick();
 
-    while (sistema_activo) {
-        float temp_local;
-        int fan_local;
-        estado_t estado_local;
+    while (ejecutando) {
+        float t;
+        Estado e;
+        int fan;
 
-        pthread_mutex_lock(&mutex_datos);
-        temp_local = temperatura_actual;
-        fan_local = ventilador_encendido;
-        estado_local = estado_actual;
-        pthread_mutex_unlock(&mutex_datos);
+        pthread_mutex_lock(&mutex);
+        t = temperatura;
+        e = estado;
+        fan = ventilador;
+        pthread_mutex_unlock(&mutex);
 
-        uint32_t ahora = gpioTick();
-        double tiempo_seg = delta_ticks(t0, ahora) / 1000000.0;
+        double segundos = tiempo_transcurrido(inicio, gpioTick()) / 1000000.0;
 
         printf("[Diagnostico] Tiempo: %.1f s | Temp: %.2f C | Estado: %s | Ventilador: %s\n",
-               tiempo_seg,
-               temp_local,
-               estado_a_texto(estado_local),
-               fan_local ? "ENCENDIDO" : "APAGADO");
+               segundos, t, texto_estado(e), fan ? "ENCENDIDO" : "APAGADO");
 
         sleep(5);
     }
@@ -288,82 +231,51 @@ void *tarea_diagnostico(void *arg) {
     return NULL;
 }
 
-/* -------------------- Main -------------------- */
+/* ---------------- MAIN ---------------- */
 
-int main(void) {
-    pthread_t th_adq, th_ctrl, th_diag;
-    int i2c_handle;
+int main() {
+    pthread_t thA, thB, thC;
+    int fd;
 
     if (gpioInitialise() < 0) {
-        fprintf(stderr, "Error: gpioInitialise() fallo\n");
-        return EXIT_FAILURE;
+        printf("Error al iniciar pigpio\n");
+        return 1;
     }
 
     gpioSetMode(FAN_GPIO, PI_OUTPUT);
     gpioWrite(FAN_GPIO, 0);
 
-    i2c_handle = i2cOpen(I2C_BUS, AHT10_ADDR, 0);
-    if (i2c_handle < 0) {
-        fprintf(stderr, "Error: i2cOpen() fallo\n");
+    fd = i2cOpen(I2C_BUS, AHT10_ADDR, 0);
+    if (fd < 0) {
+        printf("Error al abrir I2C\n");
         gpioTerminate();
-        return EXIT_FAILURE;
+        return 1;
     }
 
-    if (aht10_init(i2c_handle) < 0) {
-        fprintf(stderr, "Error: no se pudo inicializar el AHT10\n");
-        i2cClose(i2c_handle);
+    if (aht10_init(fd) < 0) {
+        printf("Error al inicializar AHT10\n");
+        i2cClose(fd);
         gpioTerminate();
-        return EXIT_FAILURE;
+        return 1;
     }
 
-    if (pthread_create(&th_adq, NULL, tarea_adquisicion, &i2c_handle) != 0) {
-        fprintf(stderr, "Error creando hilo adquisicion\n");
-        i2cClose(i2c_handle);
-        gpioTerminate();
-        return EXIT_FAILURE;
-    }
+    pthread_create(&thA, NULL, hilo_adquisicion, &fd);
+    pthread_create(&thB, NULL, hilo_control, NULL);
+    pthread_create(&thC, NULL, hilo_diagnostico, NULL);
 
-    if (pthread_create(&th_ctrl, NULL, tarea_control, NULL) != 0) {
-        fprintf(stderr, "Error creando hilo control\n");
-        sistema_activo = 0;
-        pthread_join(th_adq, NULL);
-        i2cClose(i2c_handle);
-        gpioTerminate();
-        return EXIT_FAILURE;
-    }
+    configurar_fifo(thA, 80);
+    configurar_fifo(thB, 60);
+    configurar_other(thC);
 
-    if (pthread_create(&th_diag, NULL, tarea_diagnostico, NULL) != 0) {
-        fprintf(stderr, "Error creando hilo diagnostico\n");
-        sistema_activo = 0;
-        pthread_join(th_adq, NULL);
-        pthread_join(th_ctrl, NULL);
-        i2cClose(i2c_handle);
-        gpioTerminate();
-        return EXIT_FAILURE;
-    }
+    printf("Sistema iniciado\n");
 
-    /* Prioridades */
-    if (configurar_hilo_fifo(th_adq, 80) != 0) {
-        perror("No se pudo asignar SCHED_FIFO a adquisicion");
-    }
-
-    if (configurar_hilo_fifo(th_ctrl, 60) != 0) {
-        perror("No se pudo asignar SCHED_FIFO a control");
-    }
-
-    if (configurar_hilo_other(th_diag) != 0) {
-        perror("No se pudo asignar SCHED_OTHER a diagnostico");
-    }
-
-    printf("Sistema iniciado. Ctrl+C para salir.\n");
-
-    pthread_join(th_adq, NULL);
-    pthread_join(th_ctrl, NULL);
-    pthread_join(th_diag, NULL);
+    pthread_join(thA, NULL);
+    pthread_join(thB, NULL);
+    pthread_join(thC, NULL);
 
     set_ventilador(0);
-    i2cClose(i2c_handle);
+    i2cClose(fd);
     gpioTerminate();
 
-    return EXIT_SUCCESS;
+    return 0;
 }
