@@ -1,12 +1,18 @@
-lab1/master.zip
-lab1/order
-lab1/semaforo
-lab1/contador
-lab1/calc
-lab1/cronometro
-led
-barrera
-EjecutivoCiclico/ejercicio
-caso_a
-caso_b
-caso_c
+# Binarios generados
+*.out
+*.o
+
+# Ejecutables sin extensión (más seguro con path)
+Unidad 1/lab1/calc
+Unidad 1/lab1/contador
+Unidad 1/lab1/cronometro
+Unidad 1/lab1/order
+Unidad 1/lab1/semaforo
+Unidad 1/lab1placa/led
+Unidad 1/EjecutivoCiclico/ejercicio
+
+
+Unidad 2/lab2/caso_a
+Unidad 2/lab2/caso_b
+Unidad 2/lab2/caso_c
+Unidad 2/lab2/clima
