@@ -8,19 +8,18 @@
 #include <string.h>
 #include <signal.h>
 #include <time.h>
-#include <errno.h>
 #include <pigpio.h>
 
-#define MQ_NAME              "/cola_mpu6050"
-#define SAMPLE_PERIOD_US     10000     // 10 ms = 100 Hz
-#define WINDOW_SIZE          10
+#define MQ_NAME         "/cola_mpu6050"
+#define SAMPLE_HZ       100
+#define SAMPLE_PERIOD_US 10000   // 10 ms = 100 Hz
 
-#define MPU6050_ADDR         0x68
-#define REG_PWR_MGMT_1       0x6B
-#define REG_ACCEL_XOUT_H     0x3B
-#define REG_ACCEL_CONFIG     0x1C
+#define MPU6050_ADDR    0x68
+#define REG_PWR_MGMT_1  0x6B
+#define REG_ACCEL_XOUT_H 0x3B
 
-#define SERVO_GPIO           18
+#define WINDOW_SIZE     10       // media móvil simple
+#define SERVO_GPIO      18       // opcional
 
 typedef struct {
     float x;
@@ -30,62 +29,62 @@ typedef struct {
 
 static volatile int running = 1;
 
-static mqd_t mq;
 static int i2c_handle = -1;
+static mqd_t mq;
 
+// mutex para I2C
 static pthread_mutex_t i2c_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t state_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+// mutex para variable compartida con servo
+static pthread_mutex_t state_mutex = PTHREAD_MUTEX_INITIALIZER;
 static float filtered_x_shared = 0.0f;
 
-/* =========================================================
-   Utilidades
-   ========================================================= */
+// --------------------------------------------------
+// Utilidades
+// --------------------------------------------------
 
 void handle_sigint(int sig) {
     (void)sig;
     running = 0;
 }
 
-void sleep_us(long us) {
+void sleep_exact_us(long us) {
     struct timespec ts;
     ts.tv_sec = us / 1000000;
     ts.tv_nsec = (us % 1000000) * 1000;
     nanosleep(&ts, NULL);
 }
 
-int16_t join_bytes(uint8_t high, uint8_t low) {
+int16_t combinar_bytes(uint8_t high, uint8_t low) {
     return (int16_t)((high << 8) | low);
 }
 
+// Convierte raw del acelerómetro a "g"
+// asumiendo rango ±2g => 16384 LSB/g
 float raw_to_g(int16_t raw) {
-    // Para rango ±2g => 16384 LSB/g
     return raw / 16384.0f;
 }
 
-int clamp_int(int value, int min, int max) {
-    if (value < min) return min;
-    if (value > max) return max;
-    return value;
-}
-
-int accel_x_to_angle(float x_g) {
-    // Mapea -1g..+1g a 0..180
+// Mapea aceleración en X a ángulo aproximado de servo
+// de -1g..+1g a 0..180
+int accel_to_angle(float x_g) {
     if (x_g < -1.0f) x_g = -1.0f;
     if (x_g >  1.0f) x_g =  1.0f;
 
-    return (int)((x_g + 1.0f) * 90.0f);
+    float angle = (x_g + 1.0f) * 90.0f; // -1 -> 0, 0 -> 90, +1 -> 180
+    return (int)angle;
 }
 
-int angle_to_pulsewidth(int angle) {
-    angle = clamp_int(angle, 0, 180);
-    // SG90 aprox: 500us a 2500us
-    return 500 + (angle * 2000) / 180;
+// Convierte ángulo 0..180 a pulso SG90 aprox
+int angle_to_pulse(int angle) {
+    if (angle < 0) angle = 0;
+    if (angle > 180) angle = 180;
+    return 500 + (angle * 2000) / 180; // 500us a 2500us
 }
 
-/* =========================================================
-   MPU6050
-   ========================================================= */
+// --------------------------------------------------
+// MPU6050
+// --------------------------------------------------
 
 int mpu6050_init(void) {
     pthread_mutex_lock(&i2c_mutex);
@@ -93,127 +92,114 @@ int mpu6050_init(void) {
     i2c_handle = i2cOpen(1, MPU6050_ADDR, 0);
     if (i2c_handle < 0) {
         pthread_mutex_unlock(&i2c_mutex);
-        fprintf(stderr, "Error: no se pudo abrir el MPU6050 por I2C\n");
+        fprintf(stderr, "Error: no se pudo abrir MPU6050\n");
         return -1;
     }
 
-    // Despertar sensor
+    // sacar de sleep
     if (i2cWriteByteData(i2c_handle, REG_PWR_MGMT_1, 0x00) < 0) {
         pthread_mutex_unlock(&i2c_mutex);
-        fprintf(stderr, "Error: no se pudo salir del modo sleep del MPU6050\n");
-        return -1;
-    }
-
-    // Acelerómetro en ±2g (00 en bits AFS_SEL)
-    if (i2cWriteByteData(i2c_handle, REG_ACCEL_CONFIG, 0x00) < 0) {
-        pthread_mutex_unlock(&i2c_mutex);
-        fprintf(stderr, "Error: no se pudo configurar el rango del acelerómetro\n");
+        fprintf(stderr, "Error: no se pudo inicializar MPU6050\n");
         return -1;
     }
 
     pthread_mutex_unlock(&i2c_mutex);
-
-    sleep_us(100000); // 100 ms de estabilización
-    fprintf(stderr, "MPU6050 inicializado correctamente\n");
+    fprintf(stderr, "MPU6050 listo\n");
     return 0;
 }
 
-int mpu6050_read_accel(sample_t *out) {
+int mpu6050_read_accel(sample_t *s) {
     uint8_t data[6];
 
     pthread_mutex_lock(&i2c_mutex);
+
     int n = i2cReadI2CBlockData(i2c_handle, REG_ACCEL_XOUT_H, (char *)data, 6);
+
     pthread_mutex_unlock(&i2c_mutex);
 
     if (n != 6) {
         return -1;
     }
 
-    int16_t ax_raw = join_bytes(data[0], data[1]);
-    int16_t ay_raw = join_bytes(data[2], data[3]);
-    int16_t az_raw = join_bytes(data[4], data[5]);
+    int16_t ax_raw = combinar_bytes(data[0], data[1]);
+    int16_t ay_raw = combinar_bytes(data[2], data[3]);
+    int16_t az_raw = combinar_bytes(data[4], data[5]);
 
-    out->x = raw_to_g(ax_raw);
-    out->y = raw_to_g(ay_raw);
-    out->z = raw_to_g(az_raw);
+    s->x = raw_to_g(ax_raw);
+    s->y = raw_to_g(ay_raw);
+    s->z = raw_to_g(az_raw);
 
     return 0;
 }
 
-/* =========================================================
-   Hilo productor
-   ========================================================= */
+// --------------------------------------------------
+// Hilo productor
+// --------------------------------------------------
 
 void *producer_thread(void *arg) {
     (void)arg;
 
-    while (running) {
-        sample_t s;
+    sample_t s;
 
+    while (running) {
         if (mpu6050_read_accel(&s) == 0) {
             if (mq_send(mq, (const char *)&s, sizeof(sample_t), 0) < 0) {
-                fprintf(stderr, "Error: mq_send fallo\n");
+                fprintf(stderr, "Error: mq_send\n");
             }
         } else {
-            fprintf(stderr, "Error: lectura del MPU6050\n");
+            fprintf(stderr, "Error: lectura MPU6050\n");
         }
 
-        sleep_us(SAMPLE_PERIOD_US);
+        sleep_exact_us(SAMPLE_PERIOD_US);
     }
 
     return NULL;
 }
 
-/* =========================================================
-   Hilo consumidor
-   ========================================================= */
+// --------------------------------------------------
+// Hilo consumidor
+// --------------------------------------------------
 
 void *consumer_thread(void *arg) {
     (void)arg;
 
-    sample_t window[WINDOW_SIZE];
-    memset(window, 0, sizeof(window));
-
-    int index = 0;
+    sample_t buffer[WINDOW_SIZE];
     int count = 0;
+    int index = 0;
+
+    memset(buffer, 0, sizeof(buffer));
 
     while (running) {
         sample_t s;
         ssize_t bytes = mq_receive(mq, (char *)&s, sizeof(sample_t), NULL);
 
         if (bytes < 0) {
-            if (running) {
-                fprintf(stderr, "Error: mq_receive fallo\n");
-            }
+            if (running) fprintf(stderr, "Error: mq_receive\n");
             continue;
         }
 
-        window[index] = s;
+        buffer[index] = s;
         index = (index + 1) % WINDOW_SIZE;
 
-        if (count < WINDOW_SIZE) {
-            count++;
-        }
+        if (count < WINDOW_SIZE) count++;
 
-        float sum_x = 0.0f;
-        float sum_y = 0.0f;
-        float sum_z = 0.0f;
-
+        float sum_x = 0.0f, sum_y = 0.0f, sum_z = 0.0f;
         for (int i = 0; i < count; i++) {
-            sum_x += window[i].x;
-            sum_y += window[i].y;
-            sum_z += window[i].z;
+            sum_x += buffer[i].x;
+            sum_y += buffer[i].y;
+            sum_z += buffer[i].z;
         }
 
         float fx = sum_x / count;
         float fy = sum_y / count;
         float fz = sum_z / count;
 
+        // compartir eje X filtrado con el servo
         pthread_mutex_lock(&state_mutex);
         filtered_x_shared = fx;
         pthread_mutex_unlock(&state_mutex);
 
-        // SOLO CSV por stdout
+        // MUY IMPORTANTE: solo CSV por stdout
         printf("%.4f,%.4f,%.4f\n", fx, fy, fz);
         fflush(stdout);
     }
@@ -221,9 +207,9 @@ void *consumer_thread(void *arg) {
     return NULL;
 }
 
-/* =========================================================
-   Hilo opcional servo
-   ========================================================= */
+// --------------------------------------------------
+// Hilo opcional de servo
+// --------------------------------------------------
 
 void *servo_thread(void *arg) {
     (void)arg;
@@ -235,21 +221,21 @@ void *servo_thread(void *arg) {
         x = filtered_x_shared;
         pthread_mutex_unlock(&state_mutex);
 
-        int angle = accel_x_to_angle(x);
-        int pulse = angle_to_pulsewidth(angle);
+        int angle = accel_to_angle(x);
+        int pulse = angle_to_pulse(angle);
 
         gpioServo(SERVO_GPIO, pulse);
 
-        sleep_us(20000); // 20 ms
+        sleep_exact_us(20000); // 20 ms
     }
 
     gpioServo(SERVO_GPIO, 0);
     return NULL;
 }
 
-/* =========================================================
-   Main
-   ========================================================= */
+// --------------------------------------------------
+// Main
+// --------------------------------------------------
 
 int main(int argc, char *argv[]) {
     int use_servo = 0;
@@ -266,9 +252,6 @@ int main(int argc, char *argv[]) {
     }
 
     if (mpu6050_init() != 0) {
-        if (i2c_handle >= 0) {
-            i2cClose(i2c_handle);
-        }
         gpioTerminate();
         return 1;
     }
@@ -282,60 +265,49 @@ int main(int argc, char *argv[]) {
     mq_unlink(MQ_NAME);
     mq = mq_open(MQ_NAME, O_CREAT | O_RDWR, 0644, &attr);
     if (mq == (mqd_t)-1) {
-        fprintf(stderr, "Error: mq_open fallo\n");
-        i2cClose(i2c_handle);
+        fprintf(stderr, "Error: mq_open\n");
+        if (i2c_handle >= 0) i2cClose(i2c_handle);
         gpioTerminate();
         return 1;
     }
 
-    pthread_t producer;
-    pthread_t consumer;
-    pthread_t servo;
+    pthread_t prod, cons, servo;
 
-    if (pthread_create(&producer, NULL, producer_thread, NULL) != 0) {
-        fprintf(stderr, "Error: no se pudo crear el hilo productor\n");
+    if (pthread_create(&prod, NULL, producer_thread, NULL) != 0) {
+        fprintf(stderr, "Error: pthread_create productor\n");
         mq_close(mq);
         mq_unlink(MQ_NAME);
-        i2cClose(i2c_handle);
+        if (i2c_handle >= 0) i2cClose(i2c_handle);
         gpioTerminate();
         return 1;
     }
 
-    if (pthread_create(&consumer, NULL, consumer_thread, NULL) != 0) {
-        fprintf(stderr, "Error: no se pudo crear el hilo consumidor\n");
+    if (pthread_create(&cons, NULL, consumer_thread, NULL) != 0) {
+        fprintf(stderr, "Error: pthread_create consumidor\n");
         running = 0;
-        pthread_join(producer, NULL);
+        pthread_join(prod, NULL);
         mq_close(mq);
         mq_unlink(MQ_NAME);
-        i2cClose(i2c_handle);
+        if (i2c_handle >= 0) i2cClose(i2c_handle);
         gpioTerminate();
         return 1;
     }
 
     if (use_servo) {
-        if (gpioSetMode(SERVO_GPIO, PI_OUTPUT) != 0) {
-            fprintf(stderr, "Advertencia: no se pudo configurar el pin del servo\n");
-        }
-
         if (pthread_create(&servo, NULL, servo_thread, NULL) != 0) {
-            fprintf(stderr, "Advertencia: no se pudo crear el hilo del servo\n");
-            use_servo = 0;
+            fprintf(stderr, "Error: pthread_create servo\n");
+            running = 0;
         }
     }
 
-    pthread_join(producer, NULL);
-    pthread_join(consumer, NULL);
-
-    if (use_servo) {
-        pthread_join(servo, NULL);
-    }
+    pthread_join(prod, NULL);
+    pthread_join(cons, NULL);
+    if (use_servo) pthread_join(servo, NULL);
 
     mq_close(mq);
     mq_unlink(MQ_NAME);
 
-    if (i2c_handle >= 0) {
-        i2cClose(i2c_handle);
-    }
+    if (i2c_handle >= 0) i2cClose(i2c_handle);
 
     gpioTerminate();
     fprintf(stderr, "Programa finalizado\n");

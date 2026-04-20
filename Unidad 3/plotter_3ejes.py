@@ -66,7 +66,6 @@ ani = animation.FuncAnimation(
     update,
     interval=20,
     blit=False,
-    cache_frame_data=False
 )
 
 plt.show()
